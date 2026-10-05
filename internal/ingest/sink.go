@@ -3,6 +3,7 @@ package ingest
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -200,6 +201,123 @@ func (s *Sink) Rejections() []Rejection {
 	out := make([]Rejection, len(s.rejections))
 	copy(out, s.rejections)
 	return out
+}
+
+// RepairBatchResult 是一批修复记录在目标端的处置结果。
+// 同一批次内同一主键的冲突裁决在 Sink 锁内原子完成，
+// 因此重复运行与并发运行得到完全一致的结果。
+type RepairBatchResult struct {
+	Applied   []string    // 本次新生效的事件 ID
+	Skipped   []string    // 事件 ID 已生效过（重复重投，幂等跳过）
+	Stale     []string    // seq 旧于该主键已生效 seq（确定性过期，不改写新数据）
+	Conflicts []Rejection // 主键冲突：无法凭来源顺序安全裁决先后
+}
+
+// ApplyRepairs 落地一批修复记录（Fields 应已投影到最新结构）。
+//
+// 确定性裁决规则：
+//   - 已生效过的事件 ID：跳过（重复重投不产生重复数据）；
+//   - 同一批内同一主键只允许一条记录生效：seq 最大者胜出，
+//     seq 相同则事件 ID 字典序最小者胜出，再相同取批次内最先出现者；
+//     其余同主键记录一律以 pk_conflict 拒绝（谁生效、谁被拒与文件顺序/并发无关）；
+//   - 胜出记录若该主键从未落地：生效；
+//   - 胜出记录 seq 新于该主键已生效 seq：生效（可凭来源顺序安全判定更新）；
+//   - seq 等于已生效 seq：同一来源位置却是另一条已生效记录，无法安全判定先后
+//     -> pk_conflict 拒绝，绝不改写已有数据；
+//   - seq 旧于已生效 seq：确定性过期（stale），不回滚更新的数据。
+func (s *Sink) ApplyRepairs(events []Event) (RepairBatchResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out RepairBatchResult
+
+	// 1) 每个主键在批次内选出唯一胜出者（与输入顺序无关的确定性裁决）。
+	winnerOf := map[string]int{} // pk -> 在 events 中的下标
+	for i, e := range events {
+		w, ok := winnerOf[e.PK]
+		if !ok || repairPrecedes(events[w], e) {
+			winnerOf[e.PK] = i
+		}
+	}
+
+	// 2) 逐条裁决，全部在锁内完成，避免 check-then-apply 竞争。
+	for i, e := range events {
+		if _, dup := s.appliedIDs[e.ID]; dup {
+			out.Skipped = append(out.Skipped, e.ID)
+			continue
+		}
+		if winnerOf[e.PK] != i {
+			w := events[winnerOf[e.PK]]
+			out.Conflicts = append(out.Conflicts, Rejection{
+				EventID: e.ID, Seq: e.Seq, Reason: RejectPKConflict,
+				Detail: fmt.Sprintf("pk %q appears multiple times in one repair batch; winner is event %q (seq=%d); duplicate corrective write rejected",
+					e.PK, w.ID, w.Seq),
+			})
+			continue
+		}
+		if last, exists := s.lastSeqByPK[e.PK]; exists {
+			switch {
+			case e.Seq < last:
+				out.Stale = append(out.Stale, e.ID)
+				continue
+			case e.Seq == last:
+				out.Conflicts = append(out.Conflicts, Rejection{
+					EventID: e.ID, Seq: e.Seq, Reason: RejectPKConflict,
+					Detail: fmt.Sprintf("pk %q already applied at the same source seq=%d by another event; precedence cannot be decided safely, existing data kept",
+						e.PK, last),
+				})
+				continue
+			}
+		}
+		switch e.Op {
+		case OpInsert, OpUpdate:
+			s.rows[e.PK] = Row{PK: e.PK, Fields: e.Fields}
+		case OpDelete:
+			delete(s.rows, e.PK)
+		}
+		s.lastSeqByPK[e.PK] = e.Seq
+		s.appliedIDs[e.ID] = struct{}{}
+		out.Applied = append(out.Applied, e.ID)
+	}
+	if err := s.persistLocked(); err != nil {
+		return RepairBatchResult{}, err
+	}
+	return out, nil
+}
+
+// repairPrecedes 报告在“同主键取最新”的裁决中，候选 c 是否应取代当前胜者 cur：
+// seq 更大者胜；seq 相同则事件 ID 字典序更小者胜（结果确定、可复现）。
+func repairPrecedes(cur, c Event) bool {
+	if c.Seq != cur.Seq {
+		return c.Seq > cur.Seq
+	}
+	if c.ID != cur.ID {
+		return c.ID < cur.ID
+	}
+	return false // 完全同 seq 同 ID：保留先出现者
+}
+
+// Applied 报告某事件 ID 是否已经生效。
+func (s *Sink) Applied(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.appliedIDs[id]
+	return ok
+}
+
+// LastSeq 返回某主键已生效的最大来源 seq。
+func (s *Sink) LastSeq(pk string) (uint64, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	v, ok := s.lastSeqByPK[pk]
+	return v, ok
+}
+
+// HasRow 报告目标端当前是否存在该主键的行（delete 后为 false）。
+func (s *Sink) HasRow(pk string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.rows[pk]
+	return ok
 }
 
 // BackfillDefaults 为存量行补齐新增字段的缺省值（结构演进时调用）。

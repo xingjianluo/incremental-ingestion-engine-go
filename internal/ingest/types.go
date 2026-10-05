@@ -29,6 +29,10 @@ const (
 	RejectUnknownSchema  RejectReason = "unknown_schema"
 	RejectIncompatSchema RejectReason = "incompatible_schema"
 	RejectUnknownOp      RejectReason = "unknown_op"
+	// RejectPKConflict：修复后的记录与目标端已有主键冲突，
+	// 且无法凭来源顺序（seq）安全判定先后（修复记录的 seq 不新于该主键已生效 seq）。
+	// 此情况下绝不改写已有数据，也不静默略过。
+	RejectPKConflict RejectReason = "pk_conflict"
 )
 
 // Rejection 记录一条被拒绝的事件及其可区分原因。

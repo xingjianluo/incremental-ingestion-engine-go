@@ -48,9 +48,11 @@ func (s Schema) field(name string) (Field, bool) {
 
 // SchemaRegistry 管理结构版本并校验兼容性。
 type SchemaRegistry struct {
-	mu      sync.Mutex
-	schemas map[int]Schema
-	latest  int
+	mu          sync.Mutex
+	schemas     map[int]Schema
+	latest      int
+	history     []SchemaChange // 所有注册尝试（含被拒绝的不兼容演进）
+	historyPath string         // 非空时把变更流水持久化到该 JSONL 文件
 }
 
 // NewSchemaRegistry 创建注册表。
@@ -67,13 +69,37 @@ func NewSchemaRegistry() *SchemaRegistry {
 func (r *SchemaRegistry) Register(s Schema) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	err := r.checkRegisterLocked(s)
+	change := SchemaChange{
+		Version:  s.Version,
+		Accepted: err == nil,
+		Fields:   append([]Field(nil), s.Fields...),
+	}
+	if err != nil {
+		change.Detail = err.Error()
+	}
+	// 留痕先于状态变更：连不兼容的尝试也必须可追溯。
+	if recErr := r.recordChangeLocked(change); recErr != nil {
+		if err != nil {
+			return fmt.Errorf("%w (also failed to record schema history: %v)", err, recErr)
+		}
+		return recErr
+	}
+	if err != nil {
+		return err
+	}
+	r.schemas[s.Version] = s
+	r.latest = s.Version
+	return nil
+}
+
+// checkRegisterLocked 校验一次版本注册是否兼容，不修改任何状态。
+func (r *SchemaRegistry) checkRegisterLocked(s Schema) error {
 	prev, ok := r.schemas[r.latest]
 	if !ok {
 		if s.Version != 1 {
 			return fmt.Errorf("%w: first schema version must be 1, got %d", ErrIncompatibleSchema, s.Version)
 		}
-		r.schemas[s.Version] = s
-		r.latest = s.Version
 		return nil
 	}
 	if s.Version != prev.Version+1 {
@@ -106,8 +132,6 @@ func (r *SchemaRegistry) Register(s Schema) error {
 				ErrIncompatibleSchema, nf.Name, s.Version)
 		}
 	}
-	r.schemas[s.Version] = s
-	r.latest = s.Version
 	return nil
 }
 
