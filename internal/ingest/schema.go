@@ -1,8 +1,12 @@
 package ingest
 
 import (
+	"bufio"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 )
@@ -47,18 +51,104 @@ func (s Schema) field(name string) (Field, bool) {
 }
 
 // SchemaRegistry 管理结构版本并校验兼容性。
+// 若构造时给定 ledgerPath，所有注册尝试（含被判定不兼容的）都会
+// 追加到本地 JSONL 变更流水，进程重启后经 Load 恢复，依然可查可解释。
 type SchemaRegistry struct {
-	mu      sync.Mutex
-	schemas map[int]Schema
-	latest  int
+	mu         sync.Mutex
+	schemas    map[int]Schema
+	latest     int
+	ledgerPath string
+	attempts   []SchemaAttempt
 }
 
-// NewSchemaRegistry 创建注册表。
-func NewSchemaRegistry() *SchemaRegistry {
-	return &SchemaRegistry{schemas: map[int]Schema{}}
+// NewSchemaRegistry 创建注册表；可选传入变更流水文件路径以持久化所有注册尝试。
+func NewSchemaRegistry(ledgerPath ...string) *SchemaRegistry {
+	r := &SchemaRegistry{schemas: map[int]Schema{}}
+	if len(ledgerPath) > 0 {
+		r.ledgerPath = ledgerPath[0]
+	}
+	return r
+}
+
+// Load 从变更流水恢复：重放已接受的版本重建注册表，并恢复全部尝试记录。
+func (r *SchemaRegistry) Load() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.schemas = map[int]Schema{}
+	r.latest = 0
+	r.attempts = nil
+	if r.ledgerPath == "" {
+		return nil
+	}
+	f, err := os.Open(r.ledgerPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 1<<20), 1<<20)
+	for sc.Scan() {
+		line := sc.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+		var a SchemaAttempt
+		if err := json.Unmarshal(line, &a); err != nil {
+			return fmt.Errorf("corrupt schema ledger %s: %w", r.ledgerPath, err)
+		}
+		r.attempts = append(r.attempts, a)
+		if a.Accepted {
+			r.schemas[a.Version] = Schema{Version: a.Version, Fields: a.Fields}
+			if a.Version > r.latest {
+				r.latest = a.Version
+			}
+		}
+	}
+	return sc.Err()
+}
+
+// Attempts 返回全部注册尝试（含被拒绝的），按发生顺序排列。
+func (r *SchemaRegistry) Attempts() []SchemaAttempt {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]SchemaAttempt, len(r.attempts))
+	copy(out, r.attempts)
+	return out
+}
+
+// recordAttemptLocked 记录一次注册尝试并追加到变更流水（若启用）。
+func (r *SchemaRegistry) recordAttemptLocked(s Schema, err error) error {
+	a := SchemaAttempt{Version: s.Version, Fields: s.Fields, Accepted: err == nil}
+	if err != nil {
+		a.Reason = err.Error()
+	}
+	r.attempts = append(r.attempts, a)
+	if r.ledgerPath == "" {
+		return nil
+	}
+	if mkErr := os.MkdirAll(filepath.Dir(r.ledgerPath), 0o755); mkErr != nil {
+		return mkErr
+	}
+	f, mkErr := os.OpenFile(r.ledgerPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if mkErr != nil {
+		return mkErr
+	}
+	defer f.Close()
+	b, mkErr := json.Marshal(a)
+	if mkErr != nil {
+		return mkErr
+	}
+	if _, mkErr := f.Write(append(b, '\n')); mkErr != nil {
+		return mkErr
+	}
+	return nil
 }
 
 // Register 注册新版本结构；不兼容的演进返回 ErrIncompatibleSchema 及可追溯详情。
+// 无论接受与否，本次尝试都会记入变更流水（若启用），重启后仍可追溯。
 // 兼容规则：
 //   - 新增字段：必须显式携带缺省值（HasDefault），允许；
 //   - 删除字段：拒绝（可能造成目标端静默错列）；
@@ -67,6 +157,14 @@ func NewSchemaRegistry() *SchemaRegistry {
 func (r *SchemaRegistry) Register(s Schema) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	err := r.registerLocked(s)
+	if recErr := r.recordAttemptLocked(s, err); recErr != nil && err == nil {
+		return recErr
+	}
+	return err
+}
+
+func (r *SchemaRegistry) registerLocked(s Schema) error {
 	prev, ok := r.schemas[r.latest]
 	if !ok {
 		if s.Version != 1 {

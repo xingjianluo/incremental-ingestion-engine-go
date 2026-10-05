@@ -3,6 +3,7 @@ package ingest
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -115,6 +116,74 @@ func (s *Sink) Apply(events []Event) (int, error) {
 		return 0, err
 	}
 	return applied, nil
+}
+
+// ApplyResubmit 原子地应用一批修复重投的事件（调用方已完成校验与投影，
+// 且批内同一主键已确定唯一候选）。与 Apply 的区别：撞上目标端已存在
+// 主键且无法凭来源顺序安全判定先后（seq <= 该主键已应用位点）时，
+// 不静默跳过，而是返回 RejectPKConflict 拒绝记录；绝不改写已有数据。
+// 返回：实际生效的事件 ID、幂等跳过的事件 ID（此前已应用过）、冲突拒绝记录。
+func (s *Sink) ApplyResubmit(events []Event) (applied, skipped []string, conflicts []Rejection, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, e := range events {
+		if _, dup := s.appliedIDs[e.ID]; dup {
+			skipped = append(skipped, e.ID) // 同一修正数据重复提交：幂等跳过
+			continue
+		}
+		if last, ok := s.lastSeqByPK[e.PK]; ok && e.Seq <= last {
+			conflicts = append(conflicts, Rejection{
+				EventID: e.ID, Seq: e.Seq,
+				Reason: RejectPKConflict,
+				Detail: fmt.Sprintf("pk %q already applied at seq %d, cannot safely order resubmitted seq %d; existing row left untouched",
+					e.PK, last, e.Seq),
+			})
+			continue
+		}
+		switch e.Op {
+		case OpInsert, OpUpdate:
+			s.rows[e.PK] = Row{PK: e.PK, Fields: e.Fields}
+		case OpDelete:
+			delete(s.rows, e.PK)
+		}
+		s.lastSeqByPK[e.PK] = e.Seq
+		s.appliedIDs[e.ID] = struct{}{}
+		applied = append(applied, e.ID)
+	}
+	if err := s.persistLocked(); err != nil {
+		return nil, nil, nil, err
+	}
+	return applied, skipped, conflicts, nil
+}
+
+// HasApplied 报告事件 ID 是否已应用过（对账与重投判定用）。
+func (s *Sink) HasApplied(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.appliedIDs[id]
+	return ok
+}
+
+// LastSeqByPK 返回各主键已应用的最大来源位点（对账用，返回副本）。
+func (s *Sink) LastSeqByPK() map[string]uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]uint64, len(s.lastSeqByPK))
+	for k, v := range s.lastSeqByPK {
+		out[k] = v
+	}
+	return out
+}
+
+// AppliedIDs 返回全部已应用事件 ID（对账用，返回副本）。
+func (s *Sink) AppliedIDs() map[string]struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]struct{}, len(s.appliedIDs))
+	for id := range s.appliedIDs {
+		out[id] = struct{}{}
+	}
+	return out
 }
 
 func (s *Sink) persistLocked() error {
